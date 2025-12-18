@@ -8,7 +8,7 @@ from messages.action_messages.answer_message_interface import AnswerMessageInter
 from messages.action_messages.command_message import CommandMessage
 from messages.action_messages.command_message_interface import CommandMessageInterface
 from messages.message import Message
-from messages.parse_message import parse_field
+from messages.parse_message import extract_command, parse_field
 from resources.base_resource import BaseResource
 
 
@@ -113,3 +113,13 @@ grep -R 'file=' codebase/gradio
 Command:
 grep -R 'file=' codebase/gradio"""
     )
+
+
+def test_extract_command_uses_last_command_field():
+    message = """Log:
+1. Command: grep -R 'redirect(' codebase/gradio - identified potential redirect in oauth.py, but not directly handling the vulnerability.
+
+Command: sed -n '1,200p' verify_files/verify.sh
+<END>Reflection: What does the observation mean? If there is an error, what caused the error and how to debug?  
+I need to inspect the verifier to learn exactly what artifact/state it expects after exploitation (e.g., a file created, specific contents). No errors yet."""
+    assert extract_command(message, "<END>") == "sed -n '1,200p' verify_files/verify.sh"
