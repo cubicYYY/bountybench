@@ -29,6 +29,7 @@ from utils.logger import get_main_logger
 SETUP_FILES_DIR = "setup_files"
 logger = get_main_logger(__name__)
 
+DETECT_DOCKER_IMAGE: str = "bountyagent"
 
 @dataclass
 class DetectAgentConfig(AgentConfig):
@@ -418,7 +419,7 @@ bash exploit.sh
 
             agent_exploit_message = DockerActionMessage(
                 resource_id=f"agent_exploit_{self.resources.docker.resource_id}",
-                docker_image="cybench/bountyagent:latest",
+                docker_image=DETECT_DOCKER_IMAGE,
                 command=exploit_command,
                 network="shared_net",
                 volumes=volumes,
