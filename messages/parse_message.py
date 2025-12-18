@@ -58,8 +58,8 @@ def parse_field(
     return extracted_field if extracted_field else None
 
 
-def extract_command(message: str, stop_str: str) -> List[str]:
-    command = parse_field(message, "Command:", stop_str=stop_str)
+def extract_command(message: str, stop_str: str) -> str:
+    command = parse_field(message, "Command:", stop_str=stop_str, from_end=True)
     if not command:
         raise Exception("Command is missing from message, cannot be a command message.")
     command = command.lstrip().lstrip("*").lstrip()
