@@ -17,6 +17,7 @@ from docker.errors import (
 
 from messages.action_messages.docker_action_message import DockerActionMessage
 from resources.base_resource import ActionMessage, BaseResourceConfig
+from resources.docker_image_manager import ensure_image_ready
 from resources.runnable_base_resource import RunnableBaseResource
 from utils.logger import get_main_logger
 
@@ -118,6 +119,12 @@ class DockerResource(RunnableBaseResource):
 
         logger.info(f"Running command in Docker: {command}")
         try:
+            ensure_image_ready(
+                client=self.client,
+                local_tag=docker_image,
+                logger=logger,
+            )
+
             container = self.client.containers.run(
                 image=docker_image,
                 command=command,  # Pass command directly without additional formatting

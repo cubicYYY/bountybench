@@ -13,6 +13,7 @@ from docker.models.containers import Container
 from messages.action_messages.action_message import ActionMessage
 from messages.action_messages.command_message import CommandMessage
 from resources.base_resource import BaseResourceConfig
+from resources.docker_image_manager import ensure_image_ready
 from resources.kali_env_resource_util import KaliEnvResourceUtil
 from resources.runnable_base_resource import RunnableBaseResource
 from resources.utils import get_stdout_text
@@ -21,7 +22,8 @@ from utils.logger import get_main_logger
 from utils.progress_logger import start_progress, stop_progress
 
 # Constants with type annotations
-DOCKER_IMAGE: str = "cybench/bountyagent:latest"
+DOCKER_IMAGE: str = "bountyagent"  # local tag used across the repo
+REMOTE_DOCKER_IMAGE: str = "cybench/bountyagent:latest" # remote image
 ENTRYPOINT: str = "/usr/local/bin/entrypoint.sh"
 DOCKER_CLIENT_INIT_TIMEOUT: int = 300
 
@@ -41,7 +43,6 @@ logger = get_main_logger(__name__)
 
 import threading
 from contextlib import contextmanager
-
 
 @contextmanager
 def timeout_context(seconds):
@@ -358,7 +359,7 @@ class KaliEnvResource(RunnableBaseResource):
     def _force_remove_container(self, container: Container, name: str):
         try:
             container.remove(force=True)
-            self.util.verify_container_removal(name, logger)
+            self.util.verify_container_removal(self.client, name, logger)
         except docker.errors.APIError as e:
             logger.error(f"Force removal failed: {e}")
             raise
@@ -370,19 +371,12 @@ class KaliEnvResource(RunnableBaseResource):
             f"Starting a new Docker container (Attempt {attempt + 1}/{MAX_RETRIES})..."
         )
         try:
-            # Pull the latest image before starting the container
-            logger.debug(f"Pulling the latest Docker image: {DOCKER_IMAGE}")
-            try:
-                self.client.images.pull(DOCKER_IMAGE)
-                logger.debug(f"Successfully pulled the latest image: {DOCKER_IMAGE}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to pull the latest image: {e}. Will use existing image if available."
-                )
+            ensure_image_ready(
+                client=self.client,
+                local_tag=DOCKER_IMAGE,
+                logger=logger,
+            )
 
-            print(self.client.containers)
-            print("in start")
-            print("-" * 90)
             container = self.client.containers.run(
                 image=DOCKER_IMAGE,
                 cgroupns="host",

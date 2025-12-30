@@ -38,6 +38,7 @@ logger = get_main_logger(__name__)
 INVARIANTS_RETRY = 3
 INVARIANTS_TIMEOUT = 5400  # 90 minutes
 
+DETECT_PATCH_DOCKER_IMAGE: str = "bountyagent"
 
 @dataclass
 class DetectPatchAgentConfig(AgentConfig):
@@ -436,7 +437,7 @@ class DetectPatchAgent(BaseAgent):
 
             exploit_execution = DockerActionMessage(
                 resource_id=f"exploit_{self.resources.docker.resource_id}",
-                docker_image="cybench/bountyagent:latest",
+                docker_image=DETECT_PATCH_DOCKER_IMAGE,
                 command=exploit_command,
                 network="shared_net",
                 work_dir=f"/app/{str(relative_path)}",
