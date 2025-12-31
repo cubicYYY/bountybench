@@ -100,6 +100,11 @@ class WorkflowRunner:
             action="store_true",
             help="Disable agent from submitting the exploit (not recommended)",
         )
+        parser.add_argument(
+            "--preserve_tmp",
+            action="store_true",
+            help="Preserve the per-run tmp directory (bounties/bounty_X/tmp_<workflow_id>) for debugging",
+        )
 
         parser.add_argument(
             "--use_cwe",

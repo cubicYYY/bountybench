@@ -41,29 +41,21 @@ source venv/bin/activate
 
 If you prefer to set up the environment manually, follow these steps:
 
-#### 1. Ensure Python 3.11 is Installed
-
-Verify that Python 3.11 is available on your system:
-
-```bash
-python3.11 --version
-```
-
-#### 2. Create a Virtual Environment
+#### 1. Create a Virtual Environment
 
 Set up a virtual environment to isolate dependencies:
 
 ```bash
-python3.11 -m venv venv
+uv venv --python 3.11
 ```
 
-#### 3. Activate and Set Up the Environment
+#### 2. Activate and Set Up the Environment
 
 Activate the virtual environment, install required dependencies (may take several minutes to tens of minutes to complete, please leave time for this installation):
 
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
 Initialize submodules (may take a few minutes to complete):
@@ -89,7 +81,7 @@ or Debian/Ubuntu (using APT):
 sudo apt-get install tree
 ```
 
-#### 4. Configure the .env File
+#### 3. Configure the .env File
 
 Create and populate an .env file in `bountybench/` with the following keys:
 

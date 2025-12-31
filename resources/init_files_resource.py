@@ -38,6 +38,7 @@ class InitFilesResourceConfig(BaseResourceConfig):
     files_dir_name: str
     tmp_dir: Path
     bounty_number: str
+    preserve_tmp: bool = False
     input_exploit_files_dir_name: Optional[str] = None
     input_verify_files_dir_name: Optional[str] = None
     output_agent_files_name: Optional[str] = None
@@ -65,10 +66,14 @@ class InitFilesResource(BaseResource):
         self.files_dir = self.task_dir / self._resource_config.files_dir_name
 
         self.tmp_dir = self._resource_config.tmp_dir
+        self.preserve_tmp = bool(getattr(self._resource_config, "preserve_tmp", False))
 
         if self.tmp_dir.exists():  # clean
-            logger.debug(f"Removing existing {self.tmp_dir}")
-            self.remove_tmp()
+            if self.preserve_tmp:
+                logger.debug(f"Preserve tmp enabled; keeping existing {self.tmp_dir}")
+            else:
+                logger.debug(f"Removing existing {self.tmp_dir}")
+                self.remove_tmp()
 
         # Create necessary directories
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -229,11 +234,16 @@ class InitFilesResource(BaseResource):
         try:
             # Clean up temporary directory
             if self.tmp_dir.exists():
-                try:
-                    self.remove_tmp()
-                    logger.debug(f"Removed temporary directory: {self.tmp_dir}")
-                except Exception as e:
-                    logger.error(f"Failed to remove temporary directory: {str(e)}")
+                if self.preserve_tmp:
+                    logger.debug(
+                        f"Preserve tmp enabled; not removing temporary directory: {self.tmp_dir}"
+                    )
+                else:
+                    try:
+                        self.remove_tmp()
+                        logger.debug(f"Removed temporary directory: {self.tmp_dir}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove temporary directory: {str(e)}")
 
             # Clean up git branches
             try:

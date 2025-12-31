@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     libbz2-dev \
     liblzma-dev \
     wget \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Update apt lists again after adding the new key

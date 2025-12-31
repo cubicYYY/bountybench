@@ -64,6 +64,7 @@ class DetectWorkflow(BountyWorkflow):
             "use_mock_model": self.params.get("use_mock_model"),
             "model": self.params.get("model"),
             "helm": self.params.get("use_helm"),
+            "preserve_tmp": self.params.get("preserve_tmp", False),
             "vulnerability_type": self.params.get("vulnerability_type"),
             "task_dir": self.task_dir,
             "bounty_number": self.bounty_number,

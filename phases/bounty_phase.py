@@ -30,6 +30,7 @@ class BountyPhase(BasePhase, ABC):
         self.helm: Any = kwargs.get("helm")
         self.bounty_number: str = kwargs.get("bounty_number", "")
         self.use_mock_model: str = kwargs.get("use_mock_model")
+        self.preserve_tmp: bool = kwargs.get("preserve_tmp", False)
 
         self._initial_prompt: str = kwargs.get("initial_prompt", "")
         self.bounty_dir: Path = (

@@ -122,6 +122,23 @@ def test_stop(resource, setup_dirs):
     assert "dev" not in branch_result.stdout, "Branch 'dev' was not removed."
 
 
+def test_stop_preserve_tmp(setup_dirs):
+    config, tmp_dir, original_files_dir, _ = setup_dirs
+    config.preserve_tmp = True
+
+    resource = InitFilesResource(resource_id="test_resource", config=config)
+
+    repo_path = tmp_dir / "original_files"
+    subprocess.run(["git", "checkout", "-b", "dev"], cwd=repo_path)
+    resource.stop()
+
+    assert tmp_dir.exists(), "tmp_dir should be preserved when preserve_tmp is enabled"
+    branch_result = subprocess.run(
+        ["git", "branch"], cwd=original_files_dir, stdout=subprocess.PIPE, text=True
+    )
+    assert "dev" not in branch_result.stdout, "Branch 'dev' was not removed."
+
+
 def test_remove_tmp(resource, setup_dirs):
     _, tmp_dir, _, _ = setup_dirs
     (tmp_dir / "subdir").mkdir(parents=True, exist_ok=True)

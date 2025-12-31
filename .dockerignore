@@ -53,3 +53,11 @@ htmlcov/
 
 # Git Submodule (we will instead create a ssh version of this file)
 .gitmodules
+
+# No logs
+logs/
+full_logs/
+error_logs/
+.venv/
+**/tmp_*
+*.log

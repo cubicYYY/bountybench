@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import docker
+from docker.models.images import Image
 
 DEFAULT_REMOTE_IMAGE: str = "cybench/bountyagent:latest"
 
@@ -86,23 +87,24 @@ def _image_matches_platform(image, platform: str) -> bool:
 
 def _pull_remote_image_for_platform(
     client: docker.DockerClient, remote: str, platform: str, logger=None
-):
+) -> Image:
     platform = _normalize_platform(platform)
     if logger:
-        logger.debug(f"Attempting to pull Docker image '{remote}' for platform {platform}")
+        logger.debug(
+            f"Attempting to pull Docker image '{remote}' for platform {platform}")
     try:
         # docker-py supports `platform` for pull on newer versions
         try:
-            client.images.pull(remote, platform=platform)
+            image = client.images.pull(remote, platform=platform)
         except TypeError:
-            client.images.pull(remote)
-        return _get_local_image(client, remote)
-    except Exception as e:
+            image = client.images.pull(remote)
+        return image
+    except docker.errors.APIError as e:
         if logger:
             logger.warning(
                 f"Failed to pull '{remote}' for platform {platform}: {e}. Will fall back to local build."
             )
-        return None
+        raise e
 
 
 def _build_local_image_from_repo_root(
@@ -195,7 +197,8 @@ def ensure_image_ready(
                 )
             return local.id
 
-        pulled = _pull_remote_image_for_platform(client, default_remote_image, platform, logger)
+        pulled = _pull_remote_image_for_platform(
+            client, default_remote_image, platform, logger)
         if pulled and _image_matches_platform(pulled, platform):
             if default_remote_image != local_tag:
                 pulled.tag(local_tag)
@@ -206,12 +209,11 @@ def ensure_image_ready(
                 )
             return pulled.id
 
-        built = _build_local_image_from_repo_root(client, local_tag, repo_root, platform, logger)
+        built = _build_local_image_from_repo_root(
+            client, local_tag, repo_root, platform, logger)
         _IMAGE_READY_CACHE[cache_key] = built.id
         if logger:
             logger.info(
                 f"Using locally built Docker image '{local_tag}' for platform {platform}: {built.id}"
             )
         return built.id
-
-

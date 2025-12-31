@@ -224,6 +224,12 @@ class NonHelmMapping:
         "openai/gpt-4.1-2025-04-14": NonHelmModelInfo(
             model_name="gpt-4.1-2025-04-14", provider=ServiceProvider.OPENAI
         ),
+        "openai/gpt-4o-mini": NonHelmModelInfo(
+            model_name="gpt-4o-mini-2024-07-18", provider=ServiceProvider.OPENAI
+        ),
+        "openai/gpt-5.2": NonHelmModelInfo(
+            model_name="gpt-5.2-2025-12-11", provider=ServiceProvider.OPENAI
+        ),
         # ------------------------
         # Anthropic Models (Claude)
         # ------------------------
