@@ -13,6 +13,7 @@
     - [5. Setup Docker Desktop App](#5-setup-docker-desktop-app)
   - [Usage](#usage)
     - [Running Workflows](#running-workflows)
+    - [Running All Bounties (Batch Runner)](#running-all-bounties-batch-runner)
     - [Running the Workflows through Web Interface](#running-the-workflows-through-web-interface)
     - [Dockerize run](#dockerize-run)
     - [Sample Run](#sample-run)
@@ -179,6 +180,42 @@ python -m workflows.runner --workflow-type patch_workflow \
 ```
 
 Please be aware that there may be a brief delay between initiating the workflow and observing the first log outputs (typically a few seconds). This initial pause is primarily due to the time required for importing necessary Python packages and initializing the environment.
+
+### Running All Bounties (Batch Runner)
+
+To run a workflow across *all* bounties on the host (no docker/dind) with checkpoint/resume support, use `run_all.py`.
+
+```bash
+python ./run_all.py --workflow WORKFLOW_TYPE --model MODEL_ID [OPTIONS]
+```
+
+**Common examples:**
+
+```bash
+# First run (creates run_results/run_all_<workflow>_<model>/...)
+python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50
+
+# Resume (skip already-successful bounties)
+python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --resume
+
+# Resume but skip previously-failed bounties
+python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --resume --no-rerun-failures
+
+# Parallel run with 4 workers (per-bounty output goes to per_bounty_logs/*.log)
+python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --workers 4
+```
+
+**Outputs (per run):**
+
+- `run_results/run_all_<workflow>_<model>/results.jsonl`: append-only JSONL of all attempts/results
+- `run_results/run_all_<workflow>_<model>/state.json`: checkpoint for resume/skip decisions
+- `run_results/run_all_<workflow>_<model>/per_bounty_logs/*.log`: combined stdout+stderr per bounty run
+
+**Resume behavior:**
+
+- By default, `--resume` is enabled and **already-successful** bounties are skipped.
+- By default, `--rerun-failures` is enabled; previously-failed bounties are **retried**.
+- When rerunning failures, `run_all.py` queues **previously-failed bounties at the end** (fresh/unknown bounties run first).
 
 ### Running the Workflows through Web Application
 
