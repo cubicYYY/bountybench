@@ -395,6 +395,19 @@ fi
 # Run the exploit script
 cd /app/exploit_files
 bash exploit.sh
+exploit_rc=$?
+
+# Ensure files created in the container are accessible to the host user running verify/cleanup.
+# The host UID/GID can be inferred from the bind-mounted /app directory ownership.
+host_uid=$(stat -c '%u' /app 2>/dev/null || echo 0)
+host_gid=$(stat -c '%g' /app 2>/dev/null || echo 0)
+for p in /app/exploit_files /app/verify_files /app/codebase; do
+    if [ -e "$p" ]; then
+        chown -R "$host_uid:$host_gid" "$p" 2>/dev/null || true
+    fi
+done
+
+exit $exploit_rc
 """
 
             with open(script_path, "w") as f:

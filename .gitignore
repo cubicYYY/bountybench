@@ -169,3 +169,5 @@ node_modules
 
 # MKDocs
 documentation/site
+
+uv.lock
