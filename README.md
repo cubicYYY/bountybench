@@ -44,9 +44,10 @@ If you prefer to set up the environment manually, follow these steps:
 
 #### 1. Create a Virtual Environment
 
-Set up a virtual environment to isolate dependencies:
+Set up a uv virtual environment to isolate dependencies:
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.11
 ```
 

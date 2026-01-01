@@ -35,6 +35,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -44,7 +45,22 @@ from typing import Dict, Iterable, List, Optional, Tuple
 LOG_SAVED_RE = re.compile(r"Saved log to:\s*(?P<path>\S+)")
 LOG_ARCHIVE_RE = re.compile(r"Archiving log to:\s*(?P<path>\S+)")
 WORKFLOW_ERROR_RE = re.compile(r"Error in (?P<wf>\S+) workflow:\s*(?P<msg>.+)")
+CWD = Path(__file__).parent
 
+# When running with multiple --workers, bounties for the same task/repo (e.g. LibreChat/bounty_0..4)
+# can overlap and race on shared git working trees / submodule gitdirs and trigger index.lock issues.
+# We add an in-process lock keyed by task_dir_name to serialize runs per repo.
+_REPO_LOCKS: Dict[str, threading.Lock] = {}
+_REPO_LOCKS_GUARD = threading.Lock()
+
+
+def _get_repo_lock(task_dir_name: str) -> threading.Lock:
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.get(task_dir_name)
+        if lock is None:
+            lock = threading.Lock()
+            _REPO_LOCKS[task_dir_name] = lock
+        return lock
 
 @dataclass(frozen=True)
 class Target:
@@ -186,7 +202,7 @@ def run_and_tee(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            cwd="/home/kali/bountybench",
+            cwd=CWD,
             env=os.environ.copy(),
         )
         assert p.stdout is not None
@@ -215,7 +231,7 @@ def run_and_capture(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
         stderr=subprocess.STDOUT,
         text=True,
         check=False,
-        cwd="/home/kali/bountybench",
+        cwd=CWD,
         env=os.environ.copy(),
     )
     combined = p.stdout or ""
@@ -251,10 +267,19 @@ def run_one(
     t0 = time.time()
     combined_out = run_dir / "per_bounty_logs" / f"{order_index:04d}_{_safe_name(t.key)}.log"
 
-    if live_output:
-        rc, combined_text = run_and_tee(cmd, combined_out)
-    else:
-        rc, combined_text = run_and_capture(cmd, combined_out)
+    repo_lock = _get_repo_lock(t.task_dir_name)
+    if not repo_lock.acquire(blocking=False):
+        print(f"--- repo-lock: waiting on {t.task_dir_name} (avoid concurrent git checkout) ---")
+        repo_lock.acquire()
+    try:
+        print(f"--- repo-lock: acquired {t.task_dir_name} ---")
+        if live_output:
+            rc, combined_text = run_and_tee(cmd, combined_out)
+        else:
+            rc, combined_text = run_and_capture(cmd, combined_out)
+    finally:
+        repo_lock.release()
+        print(f"--- repo-lock: released {t.task_dir_name} ---")
 
     dur = time.time() - t0
     finished = dt.datetime.now(dt.timezone.utc)
@@ -289,7 +314,7 @@ def run_one(
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", type=Path, default=Path("/home/kali/bountybench"))
+    ap.add_argument("--root", type=Path, default=Path(CWD))
     ap.add_argument(
         "--glob",
         dest="glob_pattern",
@@ -441,7 +466,7 @@ def main(argv: List[str]) -> int:
 
             status = "OK" if r.success else f"FAIL(rc={r.return_code})"
             print(
-                f"=== [{i}/{total}] {status} {t.key} | saved_log={r.saved_log_path} | archived={r.archived_log_path}"
+                f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path}"
             )
             if (not r.success) and r.error_reason:
                 print(f"=== reason: {r.error_reason}")
