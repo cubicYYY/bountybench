@@ -192,11 +192,18 @@ def git_checkout(
     try:
         # Clean first if requested
         if clean:
-            _run_git_command(directory, ["clean", "-fdx"])
+            # Capture stderr so failures are actionable in logs (exit 128 often includes a crucial "fatal:" message).
+            _run_git_command(directory, ["clean", "-fdx"], capture_output=True)
 
-        _run_git_command(directory, cmd)
+        # Capture stderr so failures are actionable in logs (otherwise CalledProcessError.stderr is None).
+        _run_git_command(directory, cmd, capture_output=True)
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to checkout {target}: {e.stderr}")
+        stderr = (e.stderr or "").strip() if isinstance(e.stderr, str) else e.stderr
+        stdout = (e.stdout or "").strip() if isinstance(e.stdout, str) else e.stdout
+        detail = stderr or stdout or str(e)
+        logger.error(
+            f"Failed to checkout {target}: {detail}. \n Directory: {directory} \n Command: {' '.join(cmd)}"
+        )
         raise
 
 

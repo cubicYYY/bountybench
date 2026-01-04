@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,11 @@ from utils.logger import get_main_logger
 
 # Configure logging
 logger = get_main_logger(__name__)
+
+try:
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover (non-POSIX)
+    fcntl = None  # type: ignore
 
 
 @dataclass
@@ -182,35 +188,42 @@ class InitFilesResource(BaseResource):
         Run the initialization script for the task.
         """
         try:
-            if not any(self.files_dir.iterdir()):  # If the directory is empty
-                logger.debug("Codebase is empty. Initializing Git submodules.")
-                git_submodule_update(str(self.files_dir))
+            # Prevent concurrent workflows from mutating the same task codebase at once.
+            # Many tasks are git submodules/worktrees where `.git` is a *file* pointing into
+            # the parent repo's `.git/modules/...`, so index writes can collide across runs.
+            lock_path = self.files_dir / ".bountybench_git.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("w") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    if not any(self.files_dir.iterdir()):  # If the directory is empty
+                        logger.debug("Codebase is empty. Initializing Git submodules.")
+                        git_submodule_update(str(self.files_dir))
 
-            bountyagent_dir = Path.cwd()
-            logger.debug("Cleaning up the working directory before checkout.")
-            if (bountyagent_dir / ".git").exists():
-                subprocess.run(
-                    [
-                        "find",
-                        ".git",
-                        "-type",
-                        "f",
-                        "-name",
-                        "index.lock",
-                        "-exec",
-                        "rm",
-                        "-f",
-                        "{}",
-                        ";",
-                    ],
-                    cwd=str(bountyagent_dir),
-                    stdout=sys.stdout,
-                    stderr=sys.stderr,
-                    check=True,
-                    text=True,
-                )
+                    logger.debug("Cleaning up git lockfiles before checkout.")
+                    # `.git` may be a file (submodule/worktree), so locate the real git dir
+                    # and remove stale lockfiles there.
+                    git_dir_raw = subprocess.check_output(
+                        ["git", "rev-parse", "--git-dir"],
+                        cwd=str(self.files_dir),
+                        text=True,
+                    ).strip()
+                    git_dir = Path(git_dir_raw)
+                    if not git_dir.is_absolute():
+                        git_dir = (self.files_dir / git_dir).resolve()
 
-            git_checkout(self.files_dir, self.vulnerable_commit, force=True)
+                    for lock_name in ("index.lock", "packed-refs.lock", "config.lock"):
+                        lock_file_path = git_dir / lock_name
+                        if lock_file_path.exists():
+                            with suppress(Exception):
+                                lock_file_path.unlink()
+                            logger.debug(f"Removed stale lockfile: {lock_file_path}")
+
+                    git_checkout(self.files_dir, self.vulnerable_commit, force=True)
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
             tmp_destination_path = self.tmp_dir / self.files_dir_name
             ignore_git = False  # TODO: make this as a flag in the future

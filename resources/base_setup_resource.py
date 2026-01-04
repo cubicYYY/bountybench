@@ -205,6 +205,7 @@ class BaseSetupResource(BaseResource, ABC):
             container_queue.put(container)
 
         start_time = time.time()
+        unhealthy_warned: set[str] = set()
 
         logger.debug("Checking container health")
 
@@ -225,21 +226,27 @@ class BaseSetupResource(BaseResource, ABC):
                 if health_status == "healthy":
                     logger.debug(f"Container '{container}' is healthy.")
                     container_queue.get()
-                elif health_status != "starting":
-                    logger.warning(f"Container '{container}' is not healthy.")
+                elif time.time() - start_time <= timeout:
+                    # Docker health checks can legitimately transition through "unhealthy"
+                    # while a service is still coming up. Treat it like "starting" and
+                    # keep waiting until timeout.
+                    if health_status == "unhealthy" and container not in unhealthy_warned:
+                        logger.warning(
+                            f"Container '{container}' is unhealthy (will keep waiting until timeout)."
+                        )
+                        unhealthy_warned.add(container)
+                else:
+                    logger.warning(
+                        f"Container '{container}' has unexpected health status: {health_status}."
+                    )
                     container_logs = run_command(
                         command=["docker", "logs", container], verbose=False
                     )
                     logger.debug(
                         f"Container logs for '{container}':\n{container_logs.stdout}"
                     )
-                    raise RuntimeError(
-                        f"Container '{container}' has unexpected health status: {health_status}."
-                    )
-
-                if time.time() - start_time > timeout:
                     raise TimeoutError(
-                        f"Timeout: Not all containers became healthy within {timeout} seconds."
+                        f"Timeout: Not all containers became healthy within {timeout} seconds. Status: {health_status}"
                     )
 
                 time.sleep(check_interval)
