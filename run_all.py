@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -61,6 +62,64 @@ def _get_repo_lock(task_dir_name: str) -> threading.Lock:
             lock = threading.Lock()
             _REPO_LOCKS[task_dir_name] = lock
         return lock
+
+
+def _resolve_gitdir(repo_dir: Path) -> Optional[Path]:
+    """
+    Return the actual git directory for a working tree.
+
+    Supports both:
+    - normal repos where <repo>/.git is a directory
+    - submodule/worktree-style repos where <repo>/.git is a file containing:
+      'gitdir: <relative-or-absolute-path>'
+    """
+    dotgit = repo_dir / ".git"
+    if dotgit.is_dir():
+        print(f"Git directory is a directory: {dotgit}")
+        return dotgit
+    if dotgit.is_file():
+        try:
+            content = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            print(f"Git directory is a file but could not read text: {dotgit}")
+            return None
+        prefix = "gitdir:"
+        if not content.lower().startswith(prefix):
+            print(f"Git directory is a file but does not start with 'gitdir:': {dotgit}")
+            return None
+        raw = content[len(prefix) :].strip()
+        if not raw:
+            print(f"Git directory is a file but does not have a raw path: {dotgit}")
+            return None
+        p = Path(raw)
+        print(f"Git directory is a file and has a raw path: {p}")
+        return p if p.is_absolute() else (repo_dir / p).resolve()
+    print(f"Git directory does not exist: {dotgit}")
+    return None
+
+
+def _clear_stale_git_locks_for_task(task_dir_name: str) -> None:
+    """
+    Best-effort cleanup for stale git lock files that can break checkouts,
+    e.g. 'fatal: unable to write new index file'.
+
+    Note: many task repos are submodules; their <repo>/.git is a pointer file,
+    and locks live under the referenced gitdir (usually <root>/.git/modules/...).
+    """
+    repo_dir = (CWD / "bountytasks" / task_dir_name / "codebase").resolve()
+    gitdir = _resolve_gitdir(repo_dir)
+    if not gitdir or not gitdir.exists():
+        return
+
+    try:
+        for lock in gitdir.rglob("*.lock"):
+            try:
+                print(f"Removing lock file: {lock}")
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        return
 
 @dataclass(frozen=True)
 class Target:
@@ -273,6 +332,8 @@ def run_one(
         repo_lock.acquire()
     try:
         print(f"--- repo-lock: acquired {t.task_dir_name} ---")
+        # Preflight: clear stale git lock files for this repo (handles submodule gitdirs).
+        _clear_stale_git_locks_for_task(t.task_dir_name)
         if live_output:
             rc, combined_text = run_and_tee(cmd, combined_out)
         else:
@@ -480,72 +541,126 @@ def main(argv: List[str]) -> int:
         first_failure_rc: Optional[int] = None
 
         with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            future_to_job: Dict[cf.Future[Result], Tuple[int, Target]] = {}
+            # Important: do NOT submit all jobs at once.
+            #
+            # If we do, multiple worker threads will immediately pick up jobs from the same repo and
+            # then block on the per-repo lock inside run_one(), effectively wasting workers and
+            # destroying throughput. Instead, we keep at most one in-flight job per repo and dispatch
+            # work from other repos first.
+
+            # Preserve stable repo order based on first appearance in the job list.
+            repo_queues: Dict[str, deque[Tuple[int, Target]]] = {}
+            repos_in_order: List[str] = []
             for i, t in jobs:
                 print(f"=== [{i}/{total}] QUEUE {t.key} ===")
-                fut = ex.submit(
-                    run_one,
-                    t=t,
-                    order_index=i,
-                    workflow=args.workflow,
-                    model=args.model,
-                    iterations=args.iterations,
-                    max_input_tokens=args.max_input_tokens,
-                    max_output_tokens=args.max_output_tokens,
-                    logging_level=args.logging_level,
-                    run_dir=run_dir,
-                    live_output=False,
-                )
-                future_to_job[fut] = (i, t)
+                if t.task_dir_name not in repo_queues:
+                    repo_queues[t.task_dir_name] = deque()
+                    repos_in_order.append(t.task_dir_name)
+                repo_queues[t.task_dir_name].append((i, t))
 
-            for fut in cf.as_completed(future_to_job):
-                i, t = future_to_job[fut]
-                try:
-                    r = fut.result()
-                except Exception as e:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-                    # Treat unexpected worker exceptions as failures.
-                    now = dt.datetime.now(dt.timezone.utc).isoformat()
-                    r = Result(
-                        key=t.key,
-                        task_dir_name=t.task_dir_name,
-                        bounty_number=t.bounty_number,
-                        bounty_path=t.bounty_path,
-                        workflow=args.workflow,
-                        model=args.model,
-                        phase_iterations=args.iterations,
-                        max_input_tokens=args.max_input_tokens,
-                        max_output_tokens=args.max_output_tokens,
-                        logging_level=args.logging_level,
-                        started_at=now,
-                        finished_at=now,
-                        duration_s=0.0,
-                        return_code=1,
-                        success=False,
-                        saved_log_path=None,
-                        archived_log_path=None,
-                        error_reason=f"runner exception: {e!r}",
-                        combined_output_file=str(
-                            run_dir / "per_bounty_logs" / f"{i:04d}_{_safe_name(t.key)}.log"
-                        ),
+            future_to_job: Dict[cf.Future[Result], Tuple[int, Target]] = {}
+            busy_repos: set[str] = set()
+            repo_cursor = 0
+
+            def _dispatch_ready_jobs() -> None:
+                """Submit jobs until workers are full or no non-busy repo has pending work."""
+                nonlocal repo_cursor
+                if not repos_in_order:
+                    return
+
+                while len(future_to_job) < args.workers:
+                    found = False
+                    # Round-robin to avoid starving repos later in the list.
+                    for _ in range(len(repos_in_order)):
+                        repo = repos_in_order[repo_cursor]
+                        repo_cursor = (repo_cursor + 1) % len(repos_in_order)
+                        if repo in busy_repos:
+                            continue
+                        q = repo_queues.get(repo)
+                        if not q:
+                            continue
+                        if len(q) == 0:
+                            continue
+                        i, t = q.popleft()
+                        busy_repos.add(repo)
+                        print(f"=== [{i}/{total}] DISPATCH {t.key} ===")
+                        fut = ex.submit(
+                            run_one,
+                            t=t,
+                            order_index=i,
+                            workflow=args.workflow,
+                            model=args.model,
+                            iterations=args.iterations,
+                            max_input_tokens=args.max_input_tokens,
+                            max_output_tokens=args.max_output_tokens,
+                            logging_level=args.logging_level,
+                            run_dir=run_dir,
+                            live_output=False,
+                        )
+                        future_to_job[fut] = (i, t)
+                        found = True
+                        break
+                    if not found:
+                        return
+
+            _dispatch_ready_jobs()
+
+            while future_to_job:
+                done, _ = cf.wait(future_to_job, return_when=cf.FIRST_COMPLETED)
+                for fut in done:
+                    i, t = future_to_job.pop(fut)
+                    busy_repos.discard(t.task_dir_name)
+                    try:
+                        r = fut.result()
+                    except Exception as e:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                        # Treat unexpected worker exceptions as failures.
+                        now = dt.datetime.now(dt.timezone.utc).isoformat()
+                        r = Result(
+                            key=t.key,
+                            task_dir_name=t.task_dir_name,
+                            bounty_number=t.bounty_number,
+                            bounty_path=t.bounty_path,
+                            workflow=args.workflow,
+                            model=args.model,
+                            phase_iterations=args.iterations,
+                            max_input_tokens=args.max_input_tokens,
+                            max_output_tokens=args.max_output_tokens,
+                            logging_level=args.logging_level,
+                            started_at=now,
+                            finished_at=now,
+                            duration_s=0.0,
+                            return_code=1,
+                            success=False,
+                            saved_log_path=None,
+                            archived_log_path=None,
+                            error_reason=f"runner exception: {e!r}",
+                            combined_output_file=str(
+                                run_dir / "per_bounty_logs" / f"{i:04d}_{_safe_name(t.key)}.log"
+                            ),
+                        )
+
+                    with results_file.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
+                    state[t.key] = asdict(r)
+                    save_state(state_file, state)
+
+                    status = "OK" if r.success else f"FAIL(rc={r.return_code})"
+                    print(
+                        f"=== [{i}/{total}] {status} {t.key} | saved_log={r.saved_log_path} | archived={r.archived_log_path}"
                     )
+                    if (not r.success) and r.error_reason:
+                        print(f"=== reason: {r.error_reason}")
 
-                with results_file.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
-                state[t.key] = asdict(r)
-                save_state(state_file, state)
+                    if (not r.success) and (not args.continue_on_fail) and first_failure_rc is None:
+                        first_failure_rc = r.return_code if r.return_code != 0 else 1
+                        # Stop dispatching new jobs; best-effort cancel not-yet-started futures.
+                        for pending in future_to_job:
+                            pending.cancel()
+                        # Also drop any still-pending queued jobs.
+                        repo_queues.clear()
 
-                status = "OK" if r.success else f"FAIL(rc={r.return_code})"
-                print(
-                    f"=== [{i}/{total}] {status} {t.key} | saved_log={r.saved_log_path} | archived={r.archived_log_path}"
-                )
-                if (not r.success) and r.error_reason:
-                    print(f"=== reason: {r.error_reason}")
-
-                if (not r.success) and (not args.continue_on_fail) and first_failure_rc is None:
-                    first_failure_rc = r.return_code if r.return_code != 0 else 1
-                    # Best-effort: cancel futures that haven't started yet.
-                    for pending in future_to_job:
-                        pending.cancel()
+                if first_failure_rc is None:
+                    _dispatch_ready_jobs()
 
         if first_failure_rc is not None:
             print("Stopping early due to failure (use --continue-on-fail to keep going).", file=sys.stderr)
