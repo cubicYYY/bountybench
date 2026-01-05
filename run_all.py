@@ -5,7 +5,7 @@ with checkpoint/resume support.
 
 This script is a Python equivalent of `run_all.sh`, plus:
 - resume: skip already-successful (task_dir, bounty_number) runs from a state file
-- optional rerun of failures
+- optional rerun of undone tasks
 - per-run combined output log files
 - a JSONL results file you can parse later
 - optional parallelism via --workers
@@ -17,8 +17,8 @@ Examples:
   # Resume (skips previously successful bounties)
   python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --resume
 
-  # Resume but rerun failures too
-  python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --resume --rerun-failures
+  # Resume but rerun undone tasks too
+  python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --resume --rerun-undone
 
   # Parallel run with 4 workers (per-bounty output still goes to per_bounty_logs/*.log)
   python ./run_all.py --workflow exploit_workflow --model openai/gpt-5.2 --iterations 50 --workers 4
@@ -56,6 +56,38 @@ def _strip_ansi(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
     return _ANSI_RE.sub("", s)
+
+
+def _kill_process_tree(p: subprocess.Popen, timeout_s: int = 10) -> None:
+    """
+    Best-effort termination of a subprocess and its children.
+    Uses process groups on POSIX when possible.
+    """
+    try:
+        # POSIX: kill process group if we started one
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            try:
+                os.killpg(os.getpgid(p.pid), 15)  # SIGTERM
+            except Exception:
+                p.terminate()
+        else:
+            p.terminate()
+        try:
+            p.wait(timeout=timeout_s)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            try:
+                os.killpg(os.getpgid(p.pid), 9)  # SIGKILL
+            except Exception:
+                p.kill()
+        else:
+            p.kill()
+        p.wait(timeout=timeout_s)
+    except Exception:
+        # Do not raise from cleanup
+        return
 
 # When running with multiple --workers, bounties for the same task/repo (e.g. LibreChat/bounty_0..4)
 # can overlap and race on shared git working trees / submodule gitdirs and trigger index.lock issues.
@@ -415,7 +447,9 @@ def build_cmd(
     ]
 
 
-def run_and_tee(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
+def run_and_tee(
+    cmd: List[str], combined_out_path: Path, timeout_s: int
+) -> Tuple[int, str]:
     """
     Run cmd, stream output to console, and write combined stdout+stderr to file.
     Returns (return_code, combined_text).
@@ -423,27 +457,67 @@ def run_and_tee(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
     combined_out_path.parent.mkdir(parents=True, exist_ok=True)
     with combined_out_path.open("w", encoding="utf-8", errors="replace") as f:
         # Merge stderr into stdout to preserve order.
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=CWD,
-            env=os.environ.copy(),
-        )
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "cwd": CWD,
+            "env": os.environ.copy(),
+            "bufsize": 1,
+        }
+        # On POSIX, start a new process group so we can terminate the whole tree on timeout.
+        if os.name == "posix":
+            popen_kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
+
+        p = subprocess.Popen(cmd, **popen_kwargs)
         assert p.stdout is not None
+
         buf: List[str] = []
-        for line in p.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            f.write(line)
-            buf.append(line)
-        rc = p.wait()
+        stop_read = threading.Event()
+
+        def _reader() -> None:
+            try:
+                for line in p.stdout:
+                    if stop_read.is_set():
+                        break
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    f.write(line)
+                    f.flush()
+                    buf.append(line)
+            except Exception:
+                return
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+        timed_out = False
+        try:
+            rc = p.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            f.write(f"\n[run_all] TIMEOUT after {timeout_s}s\n")
+            f.flush()
+            _kill_process_tree(p)
+            rc = 124
+        finally:
+            stop_read.set()
+            try:
+                if p.stdout:
+                    p.stdout.close()
+            except Exception:
+                pass
+            t.join(timeout=2)
+
         combined = "".join(buf)
+        if timed_out:
+            combined += f"\n[run_all] TIMEOUT after {timeout_s}s\n"
         return rc, combined
 
 
-def run_and_capture(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
+def run_and_capture(
+    cmd: List[str], combined_out_path: Path, timeout_s: int
+) -> Tuple[int, str]:
     """
     Run cmd and capture combined stdout+stderr, writing it to combined_out_path.
     Returns (return_code, combined_text).
@@ -451,18 +525,25 @@ def run_and_capture(cmd: List[str], combined_out_path: Path) -> Tuple[int, str]:
     This is used for parallel runs to avoid interleaved live output on the console.
     """
     combined_out_path.parent.mkdir(parents=True, exist_ok=True)
-    p = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-        cwd=CWD,
-        env=os.environ.copy(),
-    )
-    combined = p.stdout or ""
-    combined_out_path.write_text(combined, encoding="utf-8", errors="replace")
-    return p.returncode, combined
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            cwd=CWD,
+            env=os.environ.copy(),
+            timeout=timeout_s,
+        )
+        combined = p.stdout or ""
+        combined_out_path.write_text(combined, encoding="utf-8", errors="replace")
+        return p.returncode, combined
+    except subprocess.TimeoutExpired as e:
+        combined = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        combined += f"\n[run_all] TIMEOUT after {timeout_s}s\n"
+        combined_out_path.write_text(combined, encoding="utf-8", errors="replace")
+        return 124, combined
 
 
 def run_one(
@@ -477,6 +558,7 @@ def run_one(
     logging_level: str,
     run_dir: Path,
     live_output: bool,
+    task_timeout_s: int,
 ) -> Result:
     cmd = build_cmd(
         workflow=workflow,
@@ -502,9 +584,9 @@ def run_one(
         # Preflight: clear stale git lock files for this repo (handles submodule gitdirs).
         _clear_stale_git_locks_for_task(t.task_dir_name)
         if live_output:
-            rc, combined_text = run_and_tee(cmd, combined_out)
+            rc, combined_text = run_and_tee(cmd, combined_out, task_timeout_s)
         else:
-            rc, combined_text = run_and_capture(cmd, combined_out)
+            rc, combined_text = run_and_capture(cmd, combined_out, task_timeout_s)
     finally:
         repo_lock.release()
         print(f"--- repo-lock: released {t.task_dir_name} ---")
@@ -528,6 +610,8 @@ def run_one(
 
     # Ensure we still propagate a helpful reason in common cases.
     if not error_reason:
+        if rc == 124:
+            error_reason = f"task timeout after {task_timeout_s}s"
         if _workflow_requires_env_preflight(workflow) and not env_ok:
             env_preflight = _extract_env_preflight_from_log(saved_log)
             detail = env_preflight.get("error_reason") or "unknown"
@@ -589,6 +673,12 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--max-output-tokens", type=int, default=8192)
     ap.add_argument("--logging-level", default="INFO")
     ap.add_argument(
+        "--task-timeout-s",
+        type=int,
+        default=10800,
+        help="Per-bounty hard timeout in seconds (default: 10800 = 3h).",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -611,17 +701,17 @@ def main(argv: List[str]) -> int:
 
     rerun_mode = ap.add_mutually_exclusive_group()
     rerun_mode.add_argument(
-        "--rerun-failures",
-        dest="rerun_failures",
+        "--rerun-undone",
+        dest="rerun_undone",
         action="store_true",
         default=True,
-        help="When used with --resume, rerun failures too (default)",
+        help="When used with --resume, rerun undone tasks too (default)",
     )
     rerun_mode.add_argument(
-        "--no-rerun-failures",
-        dest="rerun_failures",
+        "--no-rerun-undone",
+        dest="rerun_undone",
         action="store_false",
-        help="When used with --resume, skip previous failures",
+        help="When used with --resume, skip previous undone tasks",
     )
 
     fail_mode = ap.add_mutually_exclusive_group()
@@ -690,13 +780,22 @@ def main(argv: List[str]) -> int:
         )
         return done
 
-    # Only rerun undone tasks.
+    # Only rerun undone tasks if enabled; otherwise rerun only never-tried tasks.
     jobs: List[Tuple[int, Target]] = []
     for i, t in enumerate(targets, start=1):
         prev = state.get(t.key)
-        if args.resume and prev and _prev_is_done(prev):
-            print(f"[{i}/{total}] SKIP (already done): {t.key}")
+        if args.resume and prev:
+            if _prev_is_done(prev):
+                print(f"[{i}/{total}] SKIP (already done): {t.key}")
+                continue
+            # Previously tried but not done.
+            if not args.rerun_undone:
+                print(f"[{i}/{total}] SKIP (previously undone, rerun disabled): {t.key}")
+                continue
+            jobs.append((i, t))
             continue
+
+        # Never tried (no state entry) OR resume disabled: run it.
         jobs.append((i, t))
 
     if args.workers == 1:
@@ -726,6 +825,7 @@ def main(argv: List[str]) -> int:
                 logging_level=args.logging_level,
                 run_dir=run_dir,
                 live_output=True,
+                task_timeout_s=args.task_timeout_s,
             )
 
             with results_file.open("a", encoding="utf-8") as f:
@@ -737,11 +837,10 @@ def main(argv: List[str]) -> int:
             print(
                 f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path} | full_log= {r.combined_output_file}"
             )
-            if (not r.agent_success) and r.error_reason:
+            if (not (r.env_ok and r.agent_success and r.done)) and r.error_reason:
                 print(f"=== reason: {r.error_reason}")
 
-            # Stop-on-fail should stop on env/framework errors (done==False) or agent failure, per rc.
-            if (not r.done) and (not args.continue_on_fail):
+            if (not (r.env_ok and r.agent_success and r.done)) and (not args.continue_on_fail):
                 print("Stopping early (use --continue-on-fail to keep going).", file=sys.stderr)
                 return r.return_code if r.return_code != 0 else 1
     else:
@@ -805,6 +904,7 @@ def main(argv: List[str]) -> int:
                             logging_level=args.logging_level,
                             run_dir=run_dir,
                             live_output=False,
+                            task_timeout_s=args.task_timeout_s,
                         )
                         future_to_job[fut] = (i, t)
                         found = True
@@ -864,10 +964,10 @@ def main(argv: List[str]) -> int:
                     print(
                         f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path} | full_log= {r.combined_output_file}"
                     )
-                    if (not r.agent_success) and r.error_reason:
+                    if (not (r.env_ok and r.agent_success and r.done)) and r.error_reason:
                         print(f"=== reason: {r.error_reason}")
 
-                    if (not r.done) and (not args.continue_on_fail) and first_failure_rc is None:
+                    if (not (r.env_ok and r.agent_success and r.done)) and (not args.continue_on_fail) and first_failure_rc is None:
                         first_failure_rc = r.return_code if r.return_code != 0 else 1
                         # Stop dispatching new jobs; best-effort cancel not-yet-started futures.
                         for pending in future_to_job:
