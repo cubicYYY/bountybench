@@ -110,6 +110,35 @@ def test_setup_repo(resource, setup_dirs):
     assert result.stdout.strip() == "1", "Initial commit not found."
 
 
+def test_remove_ci_check_does_not_strip_indentation_when_no_ci_block(setup_dirs):
+    """
+    Regression: some provided exploits include heredocs that generate Python files.
+    If we globally strip indentation from exploit.sh, those generated files can break
+    (e.g., IndentationError). When there is no CI block, exploit.sh must remain unchanged.
+    """
+    config, tmp_dir, _original_files_dir, bounty_dir = setup_dirs
+
+    exploit_dir = bounty_dir / "exploit_files"
+    exploit_path = exploit_dir / "exploit.sh"
+
+    exploit_script = """#!/bin/bash
+cat > app.py <<'EOF'
+def f():
+    return 1
+EOF
+python3 -c "import app; print(app.f())"
+"""
+    exploit_path.write_text(exploit_script)
+
+    # Create a resource instance just to access the helper
+    r = InitFilesResource(resource_id="test_resource_ci_strip", config=config)
+    try:
+        r._remove_ci_check_from_exploit(exploit_dir)  # pylint: disable=protected-access
+        assert exploit_path.read_text() == exploit_script
+    finally:
+        r.stop()
+
+
 def test_stop(resource, setup_dirs):
     _, tmp_dir, original_files_dir, _ = setup_dirs
     repo_path = tmp_dir / "original_files"

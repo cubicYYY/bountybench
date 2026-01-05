@@ -392,15 +392,13 @@ class InitFilesResource(BaseResource):
             )
             try:
                 processed_script = pattern.sub(r"\1", original_script)
-                # Remove indentations
-                processed_script = "\n".join(
-                    line.lstrip() for line in processed_script.splitlines()
-                )
-                exploit_path.write_text(processed_script)
-                if (
-                    "IS_CI_RUN" in original_script
-                    and "IS_CI_RUN" not in processed_script
-                ):
+                # Only write if we actually changed something.
+                #
+                # IMPORTANT: do NOT blindly left-strip indentation across the whole script.
+                # Many exploits embed heredocs (e.g., Python files) where indentation is
+                # semantically meaningful. Stripping indentation can break the exploit.
+                if processed_script != original_script:
+                    exploit_path.write_text(processed_script, encoding="utf-8")
                     logger.debug(f"Removed CI check from {exploit_path}")
             except Exception as e:
                 logger.warning(f"Failed to process {exploit_path}: {e}")

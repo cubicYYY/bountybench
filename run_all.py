@@ -40,13 +40,22 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 LOG_SAVED_RE = re.compile(r"Saved log to:\s*(?P<path>\S+)")
 LOG_ARCHIVE_RE = re.compile(r"Archiving log to:\s*(?P<path>\S+)")
 WORKFLOW_ERROR_RE = re.compile(r"Error in (?P<wf>\S+) workflow:\s*(?P<msg>.+)")
 CWD = Path(__file__).parent
+
+# Strip ANSI escape sequences (colors) from tool outputs.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    return _ANSI_RE.sub("", s)
 
 # When running with multiple --workers, bounties for the same task/repo (e.g. LibreChat/bounty_0..4)
 # can overlap and race on shared git working trees / submodule gitdirs and trigger index.lock issues.
@@ -148,11 +157,25 @@ class Result:
     finished_at: str
     duration_s: float
     return_code: int
-    success: bool
+    # Split state flags:
+    # - env_ok: preflight passed (for exploit workflows); True for workflows without preflight
+    # - agent_success: agent successfully solved the task (PoC found)
+    # - done: True only when failure (if any) is an "agent error". Any env/framework/setup
+    #         error should set done=False so the task will be rerun on resume.
+    env_ok: bool
+    agent_success: bool
+    done: bool
     saved_log_path: Optional[str]
     archived_log_path: Optional[str]
     error_reason: Optional[str]
     combined_output_file: str
+    # Env preflight (provided exploit sanity check)
+    env_preflight_passed: Optional[bool] = None
+    env_preflight_error_reason: Optional[str] = None
+    env_preflight_verify_before_exit_code: Optional[int] = None
+    env_preflight_verify_after_exit_code: Optional[int] = None
+    # Workflow-reported success (did the workflow actually solve the task?)
+    workflow_success: Optional[bool] = None
 
 
 def _safe_name(s: str) -> str:
@@ -212,6 +235,150 @@ def _extract_error_reason(text: str) -> Optional[str]:
     if m:
         return m.group("msg").strip()
     return None
+
+
+def _extract_env_preflight_from_log(log_path: Optional[str]) -> Dict[str, Any]:
+    """
+    Best-effort extraction of env preflight info from a workflow JSON log file.
+    Returns a dict with keys:
+      - passed, error_reason, verify_before_exit_code, verify_after_exit_code
+    Missing/unknown values are returned as None.
+    """
+    out: Dict[str, Any] = {
+        "passed": False,
+        "error_reason": "Environment setup failed",
+        "verify_before_exit_code": None,
+        "verify_after_exit_code": None,
+    }
+    if not log_path:
+        return out
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return out
+        data = json.loads(p.read_text(encoding="utf-8"))
+        additional_metadata = (data.get("additional_metadata") or {})
+        if not "env_preflight" in additional_metadata.keys():
+            return out
+        env_preflight = additional_metadata.get("env_preflight") or {}
+        out["passed"] = env_preflight.get("passed")
+        out["error_reason"] = env_preflight.get("error_reason")
+        out["verify_before_exit_code"] = env_preflight.get("verify_before_exit_code")
+        out["verify_after_exit_code"] = env_preflight.get("verify_after_exit_code")
+        return out
+    except Exception:
+        return out
+
+
+def _extract_workflow_success_from_log(log_path: Optional[str]) -> Optional[bool]:
+    """
+    Extract `workflow_metadata.workflow_summary.success` from the workflow JSON log.
+
+    Returns:
+        True/False if present, else None if log missing/unparseable.
+    """
+    if not log_path:
+        return None
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        summary = (data.get("workflow_metadata") or {}).get("workflow_summary") or {}
+        val = summary.get("success")
+        return val if isinstance(val, bool) else None
+    except Exception:
+        return None
+
+
+def _extract_workflow_complete_from_log(log_path: Optional[str]) -> Optional[bool]:
+    """
+    Extract `workflow_metadata.workflow_summary.complete` from the workflow JSON log.
+
+    Returns:
+        True/False if present, else None if log missing/unparseable.
+    """
+    if not log_path:
+        return None
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        summary = (data.get("workflow_metadata") or {}).get("workflow_summary") or {}
+        val = summary.get("complete")
+        return val if isinstance(val, bool) else None
+    except Exception:
+        return None
+
+
+def _workflow_requires_env_preflight(workflow: str) -> bool:
+    # Exploit workflows use ExploitPhase, which performs env preflight.
+    return workflow in {"exploit_workflow", "exploit_patch_workflow"}
+
+
+def _format_env_agent_status(r: Result) -> str:
+    env_val = r.env_ok
+    env_status = "OK" if env_val else "FAIL"
+
+    if not env_val:
+        agent_status = "(not run)"
+    else:
+        agent_status = "OK" if r.agent_success else "FAIL"
+
+    return f"Env: {env_status}. Agent: {agent_status}"
+
+
+def _classify_run(
+    *,
+    workflow: str,
+    return_code: int,
+    saved_log_path: Optional[str],
+) -> tuple[bool, bool, bool]:
+    """
+    Classify a run into (env_ok, agent_success, done).
+
+    Policy:
+    - env_ok: True iff env preflight passed (for exploit workflows). For workflows without
+      preflight, env_ok=True.
+    - agent_success: True iff workflow log reports workflow_summary.success==True.
+    - done: True ONLY when the run reached a terminal "agent outcome" (success or failure)
+      and there is no env/framework/setup error. Any non-agent error => done=False.
+    """
+    wf_complete = _extract_workflow_complete_from_log(saved_log_path)
+    wf_success = _extract_workflow_success_from_log(saved_log_path)
+
+    requires_preflight = _workflow_requires_env_preflight(workflow)
+    if requires_preflight:
+        env_preflight = _extract_env_preflight_from_log(saved_log_path)
+        env_ok = env_preflight.get("passed") is True
+    else:
+        env_ok = True
+
+    agent_success = wf_success is True
+
+    # If workflow didn't even mark complete, it's a framework/setup interruption -> undone.
+    if wf_complete is not True:
+        return env_ok, agent_success, False
+
+    # If preflight is required and did not pass, it's an env/framework issue -> undone.
+    if requires_preflight and not env_ok:
+        return env_ok, agent_success, False
+
+    # If we can't read the workflow success signal, treat as framework/logging issue -> undone.
+    if wf_success is None:
+        return env_ok, False, False
+
+    # If the workflow says success=False, that's an agent failure -> done.
+    if wf_success is False:
+        return env_ok, False, True
+
+    # wf_success is True: normally done, but if process return_code is non-zero, that's inconsistent
+    # and treated as framework error -> undone.
+    if return_code != 0:
+        return env_ok, True, False
+
+    return env_ok, True, True
 
 
 def build_cmd(
@@ -345,10 +512,34 @@ def run_one(
     dur = time.time() - t0
     finished = dt.datetime.now(dt.timezone.utc)
 
-    saved_log = _extract_first(LOG_SAVED_RE, combined_text, "path")
-    archived_log = _extract_first(LOG_ARCHIVE_RE, combined_text, "path")
+    saved_log = _strip_ansi(_extract_first(LOG_SAVED_RE, combined_text, "path"))
+    archived_log = _strip_ansi(_extract_first(LOG_ARCHIVE_RE, combined_text, "path"))
     error_reason = _extract_error_reason(combined_text)
-    success = (rc == 0)
+
+    # Compute env/agent/done from the workflow JSON log.
+    env_ok, agent_success, done = _classify_run(
+        workflow=workflow, return_code=rc, saved_log_path=saved_log
+    )
+
+    # If we consider it "undone", ensure the outer runner sees this as a failure.
+    # (But keep agent failure semantics as "done" so resume won't rerun it.)
+    if not done and rc == 0:
+        rc = 1
+
+    # Ensure we still propagate a helpful reason in common cases.
+    if not error_reason:
+        if _workflow_requires_env_preflight(workflow) and not env_ok:
+            env_preflight = _extract_env_preflight_from_log(saved_log)
+            detail = env_preflight.get("error_reason") or "unknown"
+            error_reason = f"env preflight failed: {detail}"
+        elif not done:
+            error_reason = "workflow did not complete successfully (framework/setup error)"
+        elif not agent_success:
+            error_reason = "agent did not solve the task"
+
+    # Keep these for debugging / analysis even though env_ok/agent_success/done are the new flags.
+    env_preflight = _extract_env_preflight_from_log(saved_log)
+    workflow_success = _extract_workflow_success_from_log(saved_log)
 
     return Result(
         key=t.key,
@@ -365,11 +556,20 @@ def run_one(
         finished_at=finished.isoformat(),
         duration_s=dur,
         return_code=rc,
-        success=success,
+        env_ok=env_ok,
+        agent_success=agent_success,
+        done=done,
         saved_log_path=saved_log,
         archived_log_path=archived_log,
         error_reason=error_reason,
         combined_output_file=str(combined_out),
+        env_preflight_passed=env_preflight.get("passed"),
+        env_preflight_error_reason=env_preflight.get("error_reason"),
+        env_preflight_verify_before_exit_code=env_preflight.get(
+            "verify_before_exit_code"
+        ),
+        env_preflight_verify_after_exit_code=env_preflight.get("verify_after_exit_code"),
+        workflow_success=workflow_success,
     )
 
 
@@ -467,29 +667,37 @@ def main(argv: List[str]) -> int:
     if args.workers > 1:
         print(f"Workers: {args.workers} (parallel; per-bounty output is captured into per_bounty_logs/*.log)")
 
-    # Pre-filter targets based on resume/rerun flags, but preserve stable ordering indexes.
-    #
-    # When resuming and rerunning failures, we queue previously-failed bounties *last* so
-    # fresh/unknown bounties run first (useful for long runs where you'd rather spend early
-    # time on new work than immediately retrying known failures).
-    jobs_fresh: List[Tuple[int, Target]] = []
-    jobs_failed: List[Tuple[int, Target]] = []
+    def _prev_is_done(prev: dict) -> bool:
+        # New format: explicit done flag.
+        if "done" in prev:
+            return bool(prev.get("done"))
+
+        # Back-compat: infer from the workflow log if available.
+        saved_log = _strip_ansi(prev.get("saved_log_path"))
+        workflow = str(prev.get("workflow") or "")
+        try:
+            # Use return_code from state if present; default nonzero to avoid misclassifying.
+            rc = int(prev.get("return_code", 1))
+        except Exception:
+            rc = 1
+
+        # If there's no log path, we cannot prove it's done -> rerun.
+        if not saved_log:
+            return False
+
+        _env_ok, _agent_success, done = _classify_run(
+            workflow=workflow, return_code=rc, saved_log_path=saved_log
+        )
+        return done
+
+    # Only rerun undone tasks.
+    jobs: List[Tuple[int, Target]] = []
     for i, t in enumerate(targets, start=1):
         prev = state.get(t.key)
-        if args.resume and prev:
-            prev_success = bool(prev.get("success"))
-            if prev_success:
-                print(f"[{i}/{total}] SKIP (already success): {t.key}")
-                continue
-            if not args.rerun_failures:
-                print(f"[{i}/{total}] SKIP (previous failure, rerun disabled): {t.key}")
-                continue
-            # Rerun this failure, but push it to the end of the queue.
-            jobs_failed.append((i, t))
+        if args.resume and prev and _prev_is_done(prev):
+            print(f"[{i}/{total}] SKIP (already done): {t.key}")
             continue
-        jobs_fresh.append((i, t))
-
-    jobs: List[Tuple[int, Target]] = jobs_fresh + jobs_failed
+        jobs.append((i, t))
 
     if args.workers == 1:
         # Sequential: preserve existing behavior including live output to console.
@@ -525,14 +733,15 @@ def main(argv: List[str]) -> int:
             state[t.key] = asdict(r)
             save_state(state_file, state)
 
-            status = "OK" if r.success else f"FAIL(rc={r.return_code})"
+            status = _format_env_agent_status(r)
             print(
-                f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path}"
+                f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path} | full_log= {r.combined_output_file}"
             )
-            if (not r.success) and r.error_reason:
+            if (not r.agent_success) and r.error_reason:
                 print(f"=== reason: {r.error_reason}")
 
-            if (not r.success) and (not args.continue_on_fail):
+            # Stop-on-fail should stop on env/framework errors (done==False) or agent failure, per rc.
+            if (not r.done) and (not args.continue_on_fail):
                 print("Stopping early (use --continue-on-fail to keep going).", file=sys.stderr)
                 return r.return_code if r.return_code != 0 else 1
     else:
@@ -630,13 +839,20 @@ def main(argv: List[str]) -> int:
                             finished_at=now,
                             duration_s=0.0,
                             return_code=1,
-                            success=False,
+                            env_ok=False,
+                            agent_success=False,
+                            done=False,
                             saved_log_path=None,
                             archived_log_path=None,
                             error_reason=f"runner exception: {e!r}",
                             combined_output_file=str(
                                 run_dir / "per_bounty_logs" / f"{i:04d}_{_safe_name(t.key)}.log"
                             ),
+                            env_preflight_passed=None,
+                            env_preflight_error_reason=None,
+                            env_preflight_verify_before_exit_code=None,
+                            env_preflight_verify_after_exit_code=None,
+                            workflow_success=None,
                         )
 
                     with results_file.open("a", encoding="utf-8") as f:
@@ -644,14 +860,14 @@ def main(argv: List[str]) -> int:
                     state[t.key] = asdict(r)
                     save_state(state_file, state)
 
-                    status = "OK" if r.success else f"FAIL(rc={r.return_code})"
+                    status = _format_env_agent_status(r)
                     print(
-                        f"=== [{i}/{total}] {status} {t.key} | saved_log={r.saved_log_path} | archived={r.archived_log_path}"
+                        f"=== [{i}/{total}] {status} {t.key} | saved_log= {r.saved_log_path} | archived= {r.archived_log_path} | full_log= {r.combined_output_file}"
                     )
-                    if (not r.success) and r.error_reason:
+                    if (not r.agent_success) and r.error_reason:
                         print(f"=== reason: {r.error_reason}")
 
-                    if (not r.success) and (not args.continue_on_fail) and first_failure_rc is None:
+                    if (not r.done) and (not args.continue_on_fail) and first_failure_rc is None:
                         first_failure_rc = r.return_code if r.return_code != 0 else 1
                         # Stop dispatching new jobs; best-effort cancel not-yet-started futures.
                         for pending in future_to_job:
