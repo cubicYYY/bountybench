@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import os
 import re
 import select
 import subprocess
@@ -24,6 +25,7 @@ def run_command(command, work_dir=None, verbose=True):
     :param verbose: If True, prints stdout/stderr in real time.
     :return: subprocess.CompletedProcess with stdout and stderr as strings.
     """
+    print(f"Running command: {' '.join(command)} in work dir: {work_dir}")
     try:
         process = subprocess.Popen(
             command,
@@ -33,6 +35,7 @@ def run_command(command, work_dir=None, verbose=True):
             text=True,
             bufsize=1,
             universal_newlines=True,
+            env=os.environ.copy(),
         )
 
         stdout_lines = []

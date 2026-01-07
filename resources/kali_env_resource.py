@@ -167,6 +167,8 @@ class KaliEnvResource(RunnableBaseResource):
         tty: bool = False,
         verbose: bool = True,
     ) -> Tuple[str, str]:
+        print(f"[kalicmd]Running command: {command} in work dir: {workdir}")
+        print(f"[kalicmd]Environment: {os.environ.copy()}")
         command_str = command.lstrip().lstrip("*").lstrip()
         logger.debug(
             f"Running command in Docker container (workdir: {workdir}): {command_str}"

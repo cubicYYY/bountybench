@@ -191,10 +191,12 @@ class Result:
     return_code: int
     # Split state flags:
     # - env_ok: preflight passed (for exploit workflows); True for workflows without preflight
+    # - agent_submitted: True iff agent invoked FinalSubmissionCommand (i.e., attempted submission)
     # - agent_success: agent successfully solved the task (PoC found)
     # - done: True only when failure (if any) is an "agent error". Any env/framework/setup
     #         error should set done=False so the task will be rerun on resume.
     env_ok: bool
+    agent_submitted: bool
     agent_success: bool
     done: bool
     saved_log_path: Optional[str]
@@ -344,6 +346,42 @@ def _extract_workflow_complete_from_log(log_path: Optional[str]) -> Optional[boo
         return None
 
 
+def _extract_agent_submitted_from_log(log_path: Optional[str]) -> bool:
+    """
+    Best-effort detection of whether the agent attempted a submission.
+
+    Policy: consider it submitted if the workflow log contains either:
+      - an ActionMessage with command == "FinalSubmissionCommand", OR
+      - an AgentMessage with submission == True.
+      - agents_used.<agent>.submit == True (some logs encode submission here).
+    """
+    if not log_path:
+        return False
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+
+        # Some workflows store submission under agents_used.<agent>.submit (e.g. exploit_agent).
+        agents_used = data.get("agents_used") or {}
+        if isinstance(agents_used, dict):
+            for _agent_id, meta in agents_used.items():
+                if isinstance(meta, dict) and meta.get("submit") is True:
+                    return True
+
+        for phase in (data.get("phase_messages") or []):
+            for msg in (phase.get("agent_messages") or []):
+                if msg.get("submission") is True:
+                    return True
+                for am in (msg.get("action_messages") or []):
+                    if (am or {}).get("command") == "FinalSubmissionCommand":
+                        return True
+        return False
+    except Exception:
+        return False
+
+
 def _workflow_requires_env_preflight(workflow: str) -> bool:
     # Exploit workflows use ExploitPhase, which performs env preflight.
     return workflow in {"exploit_workflow", "exploit_patch_workflow"}
@@ -358,7 +396,8 @@ def _format_env_agent_status(r: Result) -> str:
     else:
         agent_status = "OK" if r.agent_success else "FAIL"
 
-    return f"Env: {env_status}. Agent: {agent_status}"
+    submitted = "YES" if r.agent_submitted else "NO"
+    return f"Env: {env_status}. Submitted: {submitted}. Agent: {agent_status}"
 
 
 def _classify_run(
@@ -602,6 +641,7 @@ def run_one(
     env_ok, agent_success, done = _classify_run(
         workflow=workflow, return_code=rc, saved_log_path=saved_log
     )
+    agent_submitted = _extract_agent_submitted_from_log(saved_log)
 
     # If we consider it "undone", ensure the outer runner sees this as a failure.
     # (But keep agent failure semantics as "done" so resume won't rerun it.)
@@ -641,6 +681,7 @@ def run_one(
         duration_s=dur,
         return_code=rc,
         env_ok=env_ok,
+        agent_submitted=agent_submitted,
         agent_success=agent_success,
         done=done,
         saved_log_path=saved_log,
@@ -940,6 +981,7 @@ def main(argv: List[str]) -> int:
                             duration_s=0.0,
                             return_code=1,
                             env_ok=False,
+                            agent_submitted=False,
                             agent_success=False,
                             done=False,
                             saved_log_path=None,
