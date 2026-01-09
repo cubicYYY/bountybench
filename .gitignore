@@ -173,5 +173,3 @@ documentation/site
 uv.lock
 
 run_results/
-
-.devcontainer/

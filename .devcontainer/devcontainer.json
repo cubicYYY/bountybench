@@ -1,33 +1,27 @@
 {
     "name": "BountyBench Dev Environment",
     "image": "mcr.microsoft.com/devcontainers/python:3.11-bookworm",
-    "features": {
-        "ghcr.io/devcontainers/features/docker-in-docker:1": {
-            "version": "latest",
-            "moby": true
+    "mounts": [
+        {
+            "source": "${localEnv:XDG_RUNTIME_DIR}/docker.sock",
+            "target": "/var/run/docker.sock",
+            "type": "bind"
         }
-    },
-    "postCreateCommand": [
-        "sudo chown -R vscode:vscode /workspaces/bountybench",
-        "sudo apt-get update",
-        "sudo apt-get install -y tree",
-        "curl -LsSf https://astral.sh/uv/install.sh | sh",
-        "uv venv --python 3.11"
     ],
-    "postAttachCommand": "source .venv/bin/activate",
+    "remoteEnv": {
+        "DOCKER_HOST": "unix:///var/run/docker.sock"
+    },
+    "postCreateCommand": "sudo chown vscode /var/run/docker.sock",
     "customizations": {
         "vscode": {
             "extensions": [
                 "ms-azuretools.vscode-docker",
                 "ms-python.python",
-                "ms-python.vscode-pylint",
-                "charliermarsh.ruff"
-            ],
-            "settings": {
-                "python.defaultInterpreterPath": ".venv/bin/python"
-            }
+                "ms-python.vscode-pylint"
+            ]
         }
     },
     "remoteUser": "vscode",
-    "workspaceFolder": "/workspaces/bountybench"
+    "workspaceFolder": "${localWorkspaceFolder}",
+    "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind"
 }
